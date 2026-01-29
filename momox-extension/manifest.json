@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "Momox Price Checker",
+  "version": "1.0",
+  "description": "Affiche le prix Momox au survol d'un lien contenant un ASIN ou EAN13.",
+  "permissions": [
+    "activeTab",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://www.momox-shop.fr/*",
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["utils.js", "content.js"],
+      "css": ["styles.css"]
+    }
+  ]
+}

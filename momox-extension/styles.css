@@ -1,0 +1,30 @@
+
+/* styles.css */
+#momox-price-tooltip {
+    position: fixed;
+    z-index: 10000;
+    background-color: #fff;
+    border: 1px solid #ccc;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-family: sans-serif;
+    font-size: 14px;
+    color: #333;
+    pointer-events: none; /* Let events pass through so we don't block clicking */
+    transition: opacity 0.2s;
+}
+
+#momox-price-tooltip .price {
+    font-weight: bold;
+    color: #d32f2f;
+}
+
+#momox-price-tooltip .loading {
+    color: #666;
+    font-style: italic;
+}
+
+#momox-price-tooltip .error {
+    color: #999;
+}
