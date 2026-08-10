@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.5.0
+// @version      2.6.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -101,23 +101,58 @@
     const hasYear = /(?:^|\D)(?:18|19|20)\d{2}(?:\D|$)/.test(text);
     const hasFormat = /\b(broche|relie|poche|cartonne|ebook|livre numerique|couverture souple|couverture rigide)\b/.test(text);
     const hasReviewLink = /\bmon avis\b/.test(text);
+    const hasIsbn = /\bisbn\s*[:：]?\s*97[89]/.test(text);
+    const hasPublication = /\b(paru|publie|sorti)\s+le\b/.test(text);
+    const hasPricePitch = /\b(comparez? les offres|decouvrez les prix du jour|en occasion ou en neuf)\b/.test(text);
     const middleDots = (String(value || '').match(/·/g) || []).length;
 
     // Sur Chasse aux Livres, la description SEO peut être uniquement la fiche
     // technique : titre, auteur, éditeur, format, pages, année, catégorie, avis.
-    return hasReviewLink ||
+    return hasReviewLink || hasPricePitch ||
+      (hasIsbn && (hasPublication || hasFormat)) ||
       (hasPages && hasFormat) ||
       (hasPages && hasYear && middleDots >= 2) ||
       (hasFormat && hasYear && middleDots >= 3);
   }
 
   function usableSummary(value) {
-    const text = clean(value);
+    const text = clean(value).replace(
+      /^(?:résumé|resume|description)(?: du livre)?\s*[:\-–—]?\s+/i,
+      ''
+    );
     if (text.length < 60 || text.length > 12000) return '';
     if (/^(paru|publie|sorti)\s+le\b/i.test(comparable(text))) return '';
     if (/^(resume|description)(\s+voir tout)?$/i.test(comparable(text))) return '';
     if (looksLikeBookMetadata(text)) return '';
     return text;
+  }
+
+  function summaryFromPageLines() {
+    const lines = pageLines();
+    const stopAt = /^(du meme auteur|dans la meme serie|vous aimerez aussi|articles similaires|autres editions|caracteristiques|details du livre|avis des lecteurs|offres|prix)$/;
+
+    for (let index = 0; index < lines.length; index += 1) {
+      if (!/^(resume|description)( du livre)?$/.test(comparable(lines[index]))) continue;
+
+      const collected = [];
+      let foundBoundary = false;
+      for (let cursor = index + 1; cursor < Math.min(lines.length, index + 80); cursor += 1) {
+        const line = lines[cursor];
+        const normalized = comparable(line);
+        if (stopAt.test(normalized)) {
+          foundBoundary = true;
+          break;
+        }
+        if (/^(voir plus|voir moins|replier|deplier|↑|↓)$/.test(normalized)) continue;
+        if (!/[a-z0-9à-ÿ]/i.test(line)) continue;
+        collected.push(line);
+        if (collected.join(' ').length > 12000) break;
+      }
+
+      const text = usableSummary(collected.join('\n'));
+      if (text && foundBoundary) return text;
+    }
+    return '';
   }
 
   function embeddedSummaryCandidates() {
@@ -127,7 +162,7 @@
       if (typeof value === 'string') {
         if (/(resume|summary|synopsis|description|presentation)/i.test(comparable(key))) {
           const text = usableSummary(value);
-          if (text) found.push({ text, score: /(resume|summary|synopsis)/i.test(comparable(key)) ? 100 : 60 });
+          if (text) found.push({ text, score: /(resume|summary|synopsis)/i.test(comparable(key)) ? 100 : 40 });
         }
         return;
       }
@@ -148,7 +183,7 @@
 
   function summaryNearHeading() {
     const labels = [...document.querySelectorAll(
-      'a, button, h2, h3, h4, h5, [role="heading"], dt, strong, span'
+      'a, button, h1, h2, h3, h4, h5, h6, [role="heading"], dt, strong, span, div'
     )].filter((element) => (
       !element.closest(`#${PANEL_ID}`) && /^(resume|description)( du livre)?$/.test(comparable(element.textContent))
     ));
@@ -183,8 +218,13 @@
       for (let index = 0; sibling && index < 4; index += 1, sibling = sibling.nextElementSibling) {
         add(sibling, 90 - index);
       }
-      add(label.parentElement?.nextElementSibling, 80);
-      add(label.parentElement?.parentElement?.nextElementSibling, 70);
+      let ancestor = label.parentElement;
+      for (let level = 0; ancestor && level < 6; level += 1, ancestor = ancestor.parentElement) {
+        let afterAncestor = ancestor.nextElementSibling;
+        for (let offset = 0; afterAncestor && offset < 3; offset += 1, afterAncestor = afterAncestor.nextElementSibling) {
+          add(afterAncestor, 110 - (level * 8) - offset);
+        }
+      }
 
       const section = label.closest('section, article, [role="tabpanel"]');
       if (section) {
@@ -200,18 +240,14 @@
     return candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)[0]?.text || '';
   }
 
-  function readSummary(primaryBook) {
+  function readSummary() {
     const selectors = [
-      '[itemprop="description"]',
-      '[class*="book-description" i]',
-      '[id*="book-description" i]',
       '[class*="resume" i]',
       '[id*="resume" i]',
       '[class*="summary" i]',
       '[id*="summary" i]',
       '[class*="synopsis" i]',
       '[id*="synopsis" i]',
-      '[data-description]',
       '[data-summary]',
       '[data-resume]',
       '[data-synopsis]',
@@ -222,7 +258,6 @@
     const domCandidates = elements
       .flatMap((element) => [
         element.innerText || element.textContent,
-        element.getAttribute('data-description'),
         element.getAttribute('data-summary'),
         element.getAttribute('data-resume'),
         element.getAttribute('data-synopsis'),
@@ -231,14 +266,13 @@
       .filter(Boolean)
       .sort((a, b) => b.length - a.length);
 
-    const jsonDescription = usableSummary(namedValue(primaryBook.description));
-    const embedded = embeddedSummaryCandidates()[0]?.text || '';
+    const embedded = embeddedSummaryCandidates().find(({ score }) => score >= 100)?.text || '';
 
     return clean(
       summaryNearHeading() ||
+      summaryFromPageLines() ||
       domCandidates[0] ||
       embedded ||
-      jsonDescription ||
       ''
     );
   }
@@ -300,7 +334,7 @@
       namedValue(primaryBook.weight)
     );
 
-    const summary = readSummary(primaryBook);
+    const summary = readSummary();
 
     return { title, author, publisher, isbn13, weight, summary };
   }
@@ -405,7 +439,7 @@
       .slice(0, 20)
       .map(describeSummaryElement);
     return {
-      version: '2.5.0',
+      version: '2.6.0',
       url: location.href,
       labels,
       containers,
@@ -736,7 +770,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.5.0',
+      version: '2.6.0',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
