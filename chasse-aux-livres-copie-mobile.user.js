@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.6.0
+// @version      2.7.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -129,16 +129,20 @@
 
   function summaryFromPageLines() {
     const lines = pageLines();
-    const stopAt = /^(du meme auteur|dans la meme serie|vous aimerez aussi|articles similaires|autres editions|caracteristiques|details du livre|avis des lecteurs|offres|prix)$/;
+    const sectionLabel = (value) => comparable(value)
+      .replace(/[\u2190-\u21ff\uE000-\uF8FF]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const stopAt = /^(l['’]auteur|a propos de l['’]auteur|du meme auteur|dans la meme serie|vous aimerez aussi|articles similaires|autres editions|caracteristiques|details du livre|avis des lecteurs|offres|prix)$/;
 
     for (let index = 0; index < lines.length; index += 1) {
-      if (!/^(resume|description)( du livre)?$/.test(comparable(lines[index]))) continue;
+      if (!/^(resume|description)( du livre)?$/.test(sectionLabel(lines[index]))) continue;
 
       const collected = [];
       let foundBoundary = false;
       for (let cursor = index + 1; cursor < Math.min(lines.length, index + 80); cursor += 1) {
         const line = lines[cursor];
-        const normalized = comparable(line);
+        const normalized = sectionLabel(line);
         if (stopAt.test(normalized)) {
           foundBoundary = true;
           break;
@@ -241,40 +245,10 @@
   }
 
   function readSummary() {
-    const selectors = [
-      '[class*="resume" i]',
-      '[id*="resume" i]',
-      '[class*="summary" i]',
-      '[id*="summary" i]',
-      '[class*="synopsis" i]',
-      '[id*="synopsis" i]',
-      '[data-summary]',
-      '[data-resume]',
-      '[data-synopsis]',
-    ];
-    const elements = selectors
-      .flatMap((selector) => [...document.querySelectorAll(selector)])
-      .filter((element) => !element.closest(`#${PANEL_ID}`));
-    const domCandidates = elements
-      .flatMap((element) => [
-        element.innerText || element.textContent,
-        element.getAttribute('data-summary'),
-        element.getAttribute('data-resume'),
-        element.getAttribute('data-synopsis'),
-      ])
-      .map(usableSummary)
-      .filter(Boolean)
-      .sort((a, b) => b.length - a.length);
-
-    const embedded = embeddedSummaryCandidates().find(({ score }) => score >= 100)?.text || '';
-
-    return clean(
-      summaryNearHeading() ||
-      summaryFromPageLines() ||
-      domCandidates[0] ||
-      embedded ||
-      ''
-    );
+    // Source unique et prévisible : le texte réellement affiché entre les
+    // sections « Résumé » et « L’auteur » (ou la section suivante connue).
+    // Les descriptions SEO/JSON ne servent plus jamais de résumé.
+    return summaryFromPageLines();
   }
 
   function validIsbn13(value) {
@@ -439,7 +413,7 @@
       .slice(0, 20)
       .map(describeSummaryElement);
     return {
-      version: '2.6.0',
+      version: '2.7.0',
       url: location.href,
       labels,
       containers,
@@ -770,7 +744,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.6.0',
+      version: '2.7.0',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
