@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.4.0
+// @version      2.4.1
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -388,7 +388,7 @@
       .slice(0, 20)
       .map(describeSummaryElement);
     return {
-      version: '2.4.0',
+      version: '2.4.1',
       url: location.href,
       labels,
       containers,
@@ -719,7 +719,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.3.0',
+      version: '2.4.1',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
@@ -919,9 +919,9 @@
     if (!data.title) return;
 
     const fullBlock = [
-      `Titre : ${data.title}`,
-      `Auteur : ${data.author || 'Non indiqué'}`,
-      `Éditeur : ${data.publisher || 'Non indiqué'}`,
+      data.title,
+      data.author || 'Non indiqué',
+      data.publisher || 'Non indiqué',
     ].join('\n');
 
     const style = document.createElement('style');
