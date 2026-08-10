@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.3.0
+// @version      2.4.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -103,6 +103,32 @@
     return text;
   }
 
+  function embeddedSummaryCandidates() {
+    const found = [];
+    const visit = (value, key = '', depth = 0) => {
+      if (depth > 12 || value === null || value === undefined) return;
+      if (typeof value === 'string') {
+        if (/(resume|summary|synopsis|description|presentation)/i.test(comparable(key))) {
+          const text = usableSummary(value);
+          if (text) found.push({ text, score: /(resume|summary|synopsis)/i.test(comparable(key)) ? 100 : 60 });
+        }
+        return;
+      }
+      if (Array.isArray(value)) {
+        value.forEach((item) => visit(item, key, depth + 1));
+        return;
+      }
+      if (typeof value === 'object') {
+        Object.entries(value).forEach(([childKey, child]) => visit(child, childKey, depth + 1));
+      }
+    };
+
+    document.querySelectorAll('script[type*="json" i]').forEach((script) => {
+      try { visit(JSON.parse(script.textContent)); } catch (_) { /* JSON embarqué invalide ignoré. */ }
+    });
+    return found.sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+  }
+
   function summaryNearHeading() {
     const labels = [...document.querySelectorAll(
       'a, button, h2, h3, h4, h5, [role="heading"], dt, strong, span'
@@ -122,7 +148,16 @@
         label.getAttribute('data-target'),
         label.getAttribute('data-bs-target'),
         label.getAttribute('href'),
-      ].filter((value) => value?.startsWith('#'));
+      ].map((value) => {
+        if (!value) return '';
+        if (value.startsWith('#')) return value;
+        try {
+          const url = new URL(value, location.href);
+          return url.origin === location.origin && url.pathname === location.pathname ? url.hash : '';
+        } catch (_) {
+          return '';
+        }
+      }).filter(Boolean);
       references.forEach((reference) => {
         try { add(document.querySelector(reference), 100); } catch (_) { /* Sélecteur invalide ignoré. */ }
       });
@@ -159,19 +194,33 @@
       '[id*="summary" i]',
       '[class*="synopsis" i]',
       '[id*="synopsis" i]',
+      '[data-description]',
+      '[data-summary]',
+      '[data-resume]',
+      '[data-synopsis]',
     ];
-    const domCandidates = selectors
+    const elements = selectors
       .flatMap((selector) => [...document.querySelectorAll(selector)])
-      .filter((element) => !element.closest(`#${PANEL_ID}`))
-      .map((element) => usableSummary(element.innerText || element.textContent))
+      .filter((element) => !element.closest(`#${PANEL_ID}`));
+    const domCandidates = elements
+      .flatMap((element) => [
+        element.innerText || element.textContent,
+        element.getAttribute('data-description'),
+        element.getAttribute('data-summary'),
+        element.getAttribute('data-resume'),
+        element.getAttribute('data-synopsis'),
+      ])
+      .map(usableSummary)
       .filter(Boolean)
       .sort((a, b) => b.length - a.length);
 
     const jsonDescription = usableSummary(namedValue(primaryBook.description));
+    const embedded = embeddedSummaryCandidates()[0]?.text || '';
 
     return clean(
       summaryNearHeading() ||
       domCandidates[0] ||
+      embedded ||
       jsonDescription ||
       ''
     );
@@ -270,16 +319,122 @@
     }, 1100);
   }
 
-  function makeButton(label, value, wide = false) {
+  function updateCopyButton(button, value, emptyLabel = '') {
+    const label = button._calLabel;
+    button._calValue = value || '';
+    button.disabled = !value && !button._calOnEmpty;
+    button.querySelector('.cal-label').textContent = value
+      ? `Copier ${label}`
+      : (emptyLabel || `${label} indisponible`);
+    button.querySelector('.cal-value').textContent = value || '—';
+  }
+
+  function makeButton(label, value, wide = false, onEmpty = null) {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `cal-copy-button${wide ? ' cal-wide' : ''}`;
-    button.disabled = !value;
     button.innerHTML = `<span class="cal-label"></span><span class="cal-value"></span>`;
-    button.querySelector('.cal-label').textContent = value ? `Copier ${label}` : `${label} indisponible`;
-    button.querySelector('.cal-value').textContent = value || '—';
-    button.addEventListener('click', () => copyText(value, button));
+    button._calLabel = label;
+    button._calOnEmpty = onEmpty;
+    updateCopyButton(button, value, onEmpty ? 'Recherche du résumé…' : '');
+    button.addEventListener('click', async () => {
+      if (button._calValue) await copyText(button._calValue, button);
+      else if (button._calOnEmpty) await button._calOnEmpty(button);
+    });
     return button;
+  }
+
+  function summaryControl() {
+    return [...document.querySelectorAll('a, button, [role="button"], [role="tab"]')].find((element) => {
+      if (element.closest(`#${PANEL_ID}`)) return false;
+      if (!/^(resume|description)( du livre)?$/.test(comparable(element.textContent))) return false;
+      if (element.matches('button, [role="button"], [role="tab"]')) return true;
+      const href = element.getAttribute('href') || '';
+      if (href.startsWith('#') || /^javascript:/i.test(href)) return true;
+      try {
+        const url = new URL(href, location.href);
+        return url.origin === location.origin && url.pathname === location.pathname && Boolean(url.hash);
+      } catch (_) {
+        return false;
+      }
+    });
+  }
+
+  function describeSummaryElement(element) {
+    if (!element) return null;
+    const attributes = {};
+    for (const name of ['id', 'class', 'href', 'role', 'aria-controls', 'data-target', 'data-bs-target', 'data-description', 'data-summary', 'data-resume']) {
+      const value = element.getAttribute?.(name);
+      if (value) attributes[name] = String(value).slice(0, 800);
+    }
+    return {
+      tag: element.tagName,
+      text: clean(element.textContent).slice(0, 1200),
+      attributes,
+    };
+  }
+
+  function summaryDiagnostic() {
+    const labels = [...document.querySelectorAll('a, button, h1, h2, h3, h4, h5, span, strong, [role="heading"]')]
+      .filter((element) => /resume|description/i.test(comparable(element.textContent)))
+      .slice(0, 20)
+      .map((element) => ({
+        element: describeSummaryElement(element),
+        next: describeSummaryElement(element.nextElementSibling),
+        parentNext: describeSummaryElement(element.parentElement?.nextElementSibling),
+      }));
+    const containers = [...document.querySelectorAll('[id], [class], [data-description], [data-summary], [data-resume]')]
+      .filter((element) => /resume|summary|synopsis|description/i.test(`${element.id} ${element.className}`))
+      .slice(0, 20)
+      .map(describeSummaryElement);
+    return {
+      version: '2.4.0',
+      url: location.href,
+      labels,
+      containers,
+      embeddedCandidates: embeddedSummaryCandidates().slice(0, 10).map(({ text, score }) => ({
+        score,
+        text: text.slice(0, 1500),
+      })),
+    };
+  }
+
+  async function copySummaryDiagnostic(button) {
+    await writeClipboard(JSON.stringify(summaryDiagnostic(), null, 2));
+    const oldLabel = button.querySelector('.cal-label').textContent;
+    button.querySelector('.cal-label').textContent = '✓ Diagnostic résumé copié';
+    window.setTimeout(() => {
+      if (!button._calValue) button.querySelector('.cal-label').textContent = oldLabel;
+    }, 1400);
+  }
+
+  async function findSummaryLater(button, reveal = false) {
+    if (reveal) {
+      const control = summaryControl();
+      if (control) {
+        control.click();
+        await sleep(450);
+      }
+    }
+
+    const delays = reveal ? [0, 250, 700, 1200] : [0, 350, 700, 1200, 2200, 4000, 6500];
+    for (const delay of delays) {
+      if (delay) await sleep(delay);
+      const summary = readBookData().summary;
+      if (summary) {
+        updateCopyButton(button, summary);
+        return summary;
+      }
+    }
+    updateCopyButton(button, '', 'Copier le diagnostic résumé');
+    return '';
+  }
+
+  async function handleMissingSummary(button) {
+    updateCopyButton(button, '', 'Recherche du résumé…');
+    const summary = await findSummaryLater(button, true);
+    if (summary) await copyText(summary, button);
+    else await copySummaryDiagnostic(button);
   }
 
   async function storedGet(key, fallback = null) {
@@ -388,6 +543,11 @@
   function formatPrice(value) {
     const price = asPrice(value);
     return price === '' ? '—' : `${new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(price)} €`;
+  }
+
+  function formatWholePrice(value) {
+    const price = asPrice(value);
+    return price === '' ? '—' : `${Math.trunc(price)} €`;
   }
 
   function saleDate(value) {
@@ -626,7 +786,7 @@
         const date = document.createElement('td');
         const price = document.createElement('td');
         date.textContent = formatSaleAge(sale.date);
-        price.textContent = formatPrice(sale.price);
+        price.textContent = formatWholePrice(sale.price);
         dateRow.appendChild(date);
         priceRow.appendChild(price);
       });
@@ -892,6 +1052,7 @@
     `;
 
     const grid = panel.querySelector('.cal-grid');
+    const summaryButton = makeButton('le résumé', data.summary, false, handleMissingSummary);
     grid.append(
       makeButton('le bloc titre + auteur + éditeur', fullBlock, true),
       makeButton('le titre', data.title),
@@ -899,12 +1060,13 @@
       makeButton("l’éditeur", data.publisher),
       makeButton("l’ISBN-13", data.isbn13),
       makeButton('le poids', data.weight),
-      makeButton('le résumé', data.summary)
+      summaryButton
     );
 
     document.head.appendChild(style);
     document.body.prepend(panel);
     loadBiblioscan(data.isbn13);
+    if (!data.summary) findSummaryLater(summaryButton);
   }
 
   install();
