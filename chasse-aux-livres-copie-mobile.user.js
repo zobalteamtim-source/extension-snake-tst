@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.1.0
+// @version      2.2.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -353,6 +353,8 @@
 
   function formatSaleDate(value) {
     if (value === null || value === undefined || value === '') return '—';
+    const compactDate = String(value).match(/^(\d{4})(\d{2})(\d{2})$/);
+    if (compactDate) return `${compactDate[3]}/${compactDate[2]}/${compactDate[1].slice(2)}`;
     if (typeof value === 'number' && value > 1000000000) {
       const milliseconds = value < 100000000000 ? value * 1000 : value;
       return new Intl.DateTimeFormat('fr-FR').format(new Date(milliseconds));
@@ -366,6 +368,10 @@
 
   function saleFromObject(item) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const entries = Object.entries(item);
+    if (entries.length === 1 && /^\d{8}$/.test(entries[0][0]) && asPrice(entries[0][1]) !== '') {
+      return { date: entries[0][0], price: entries[0][1] };
+    }
     const keys = Object.keys(item);
     const priceKey = keys.find((key) => /^(price|amount|value|sale[_-]?price|sold[_-]?price|used[_-]?price|prix)$/i.test(key));
     const dateKey = keys.find((key) => /^(date|time|timestamp|sold[_-]?at|sale[_-]?date|age|ago|days[_-]?ago|label)$/i.test(key));
@@ -429,9 +435,13 @@
       .sort((a, b) => b.score - a.score);
 
     const sales = parallel.length ? parallel : (candidates[0]?.sales || []);
-    return sales
+    const recent = sales
       .filter((sale) => asPrice(sale.price) !== '')
       .slice(0, 5);
+    if (recent.length && recent.every((sale) => /^\d{8}$/.test(String(sale.date)))) {
+      recent.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    }
+    return recent;
   }
 
   async function enrichSalesSnapshot(snapshot, apiKey) {
@@ -464,7 +474,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.1.0',
+      version: '2.2.0',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
@@ -520,16 +530,17 @@
     if (sales.length) {
       const table = document.createElement('table');
       table.className = 'cal-sales-table';
-      table.innerHTML = '<thead><tr><th>Vendu</th><th>Prix</th></tr></thead><tbody></tbody>';
+      table.innerHTML = '<tbody><tr class="cal-sale-dates"><th>Vendu le</th></tr><tr class="cal-sale-prices"><th>Au prix de</th></tr></tbody>';
       const body = table.querySelector('tbody');
+      const dateRow = body.querySelector('.cal-sale-dates');
+      const priceRow = body.querySelector('.cal-sale-prices');
       sales.forEach((sale) => {
-        const row = document.createElement('tr');
         const date = document.createElement('td');
         const price = document.createElement('td');
         date.textContent = formatSaleDate(sale.date);
         price.textContent = formatPrice(sale.price);
-        row.append(date, price);
-        body.appendChild(row);
+        dateRow.appendChild(date);
+        priceRow.appendChild(price);
       });
       content.appendChild(table);
     } else {
@@ -746,13 +757,14 @@
         margin-bottom: 7px;
       }
       #${PANEL_ID} .cal-biblio-metrics span { padding: 6px; background: #eef8f1; border-radius: 7px; font-size: 11px; }
-      #${PANEL_ID} .cal-sales-table { width: 100%; margin: 3px 0 7px; border-collapse: collapse; font-size: 12px; }
+      #${PANEL_ID} .cal-sales-table { width: 100%; margin: 3px 0 7px; border-collapse: collapse; table-layout: fixed; font-size: 10px; }
       #${PANEL_ID} .cal-sales-table th, #${PANEL_ID} .cal-sales-table td {
-        padding: 6px;
-        text-align: left;
+        padding: 5px 2px;
+        text-align: center;
+        white-space: nowrap;
         border: 1px solid #c8ddd0;
       }
-      #${PANEL_ID} .cal-sales-table th { background: #eef8f1; }
+      #${PANEL_ID} .cal-sales-table th { width: 62px; text-align: left; background: #eef8f1; }
       #${PANEL_ID} .cal-biblio-notice { margin: 6px 0; font-size: 11px; line-height: 1.3; }
       #${PANEL_ID} .cal-biblio-link { display: inline-block; margin: 2px 0 6px; color: #176b39; font-size: 12px; font-weight: 750; }
       #${PANEL_ID} .cal-biblio-actions { display: flex; flex-wrap: wrap; gap: 5px; }
