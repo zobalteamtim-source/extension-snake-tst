@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.2.0
+// @version      2.3.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -95,24 +95,57 @@
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
 
+  function usableSummary(value) {
+    const text = clean(value);
+    if (text.length < 60 || text.length > 12000) return '';
+    if (/^(paru|publie|sorti)\s+le\b/i.test(comparable(text))) return '';
+    if (/^(resume|description)(\s+voir tout)?$/i.test(comparable(text))) return '';
+    return text;
+  }
+
   function summaryNearHeading() {
-    const headings = [...document.querySelectorAll('h2, h3, h4, h5, [role="heading"], dt, strong')];
-    const heading = headings.find((element) => /^(resume|description)( du livre)?$/.test(comparable(element.textContent)));
-    if (!heading) return '';
-
+    const labels = [...document.querySelectorAll(
+      'a, button, h2, h3, h4, h5, [role="heading"], dt, strong, span'
+    )].filter((element) => (
+      !element.closest(`#${PANEL_ID}`) && /^(resume|description)( du livre)?$/.test(comparable(element.textContent))
+    ));
     const candidates = [];
-    let sibling = heading.nextElementSibling;
-    for (let index = 0; sibling && index < 3; index += 1, sibling = sibling.nextElementSibling) {
-      candidates.push(clean(sibling.innerText || sibling.textContent));
-    }
+    const add = (element, score) => {
+      if (!element || element.closest?.(`#${PANEL_ID}`)) return;
+      const text = usableSummary(element.innerText || element.textContent);
+      if (text) candidates.push({ text, score });
+    };
 
-    const section = heading.closest('section, article');
-    if (section) {
-      const paragraphs = [...section.querySelectorAll('p')].map((p) => clean(p.innerText || p.textContent));
-      candidates.push(paragraphs.join('\n'));
-    }
+    labels.forEach((label) => {
+      const references = [
+        label.getAttribute('aria-controls'),
+        label.getAttribute('data-target'),
+        label.getAttribute('data-bs-target'),
+        label.getAttribute('href'),
+      ].filter((value) => value?.startsWith('#'));
+      references.forEach((reference) => {
+        try { add(document.querySelector(reference), 100); } catch (_) { /* Sélecteur invalide ignoré. */ }
+      });
 
-    return candidates.find((text) => text.length >= 40 && text.length <= 12000) || '';
+      let sibling = label.nextElementSibling;
+      for (let index = 0; sibling && index < 4; index += 1, sibling = sibling.nextElementSibling) {
+        add(sibling, 90 - index);
+      }
+      add(label.parentElement?.nextElementSibling, 80);
+      add(label.parentElement?.parentElement?.nextElementSibling, 70);
+
+      const section = label.closest('section, article, [role="tabpanel"]');
+      if (section) {
+        const paragraphs = [...section.querySelectorAll('p, li')]
+          .map((element) => clean(element.innerText || element.textContent))
+          .filter(Boolean)
+          .join('\n');
+        const text = usableSummary(paragraphs);
+        if (text) candidates.push({ text, score: 50 });
+      }
+    });
+
+    return candidates.sort((a, b) => b.score - a.score || b.text.length - a.text.length)[0]?.text || '';
   }
 
   function readSummary(primaryBook) {
@@ -122,18 +155,24 @@
       '[id*="book-description" i]',
       '[class*="resume" i]',
       '[id*="resume" i]',
+      '[class*="summary" i]',
+      '[id*="summary" i]',
+      '[class*="synopsis" i]',
+      '[id*="synopsis" i]',
     ];
     const domCandidates = selectors
       .flatMap((selector) => [...document.querySelectorAll(selector)])
       .filter((element) => !element.closest(`#${PANEL_ID}`))
-      .map((element) => clean(element.innerText || element.textContent))
-      .filter((text) => text.length >= 40 && text.length <= 12000)
-      .sort((a, b) => a.length - b.length);
+      .map((element) => usableSummary(element.innerText || element.textContent))
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+
+    const jsonDescription = usableSummary(namedValue(primaryBook.description));
 
     return clean(
-      namedValue(primaryBook.description) ||
       summaryNearHeading() ||
       domCandidates[0] ||
+      jsonDescription ||
       ''
     );
   }
@@ -351,19 +390,65 @@
     return price === '' ? '—' : `${new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(price)} €`;
   }
 
-  function formatSaleDate(value) {
-    if (value === null || value === undefined || value === '') return '—';
+  function saleDate(value) {
+    if (value === null || value === undefined || value === '') return null;
     const compactDate = String(value).match(/^(\d{4})(\d{2})(\d{2})$/);
-    if (compactDate) return `${compactDate[3]}/${compactDate[2]}/${compactDate[1].slice(2)}`;
+    if (compactDate) {
+      return new Date(Date.UTC(Number(compactDate[1]), Number(compactDate[2]) - 1, Number(compactDate[3])));
+    }
     if (typeof value === 'number' && value > 1000000000) {
-      const milliseconds = value < 100000000000 ? value * 1000 : value;
-      return new Intl.DateTimeFormat('fr-FR').format(new Date(milliseconds));
+      return new Date(value < 100000000000 ? value * 1000 : value);
     }
-    const date = new Date(value);
-    if (!Number.isNaN(date.getTime()) && /[-/:T]/.test(String(value))) {
-      return new Intl.DateTimeFormat('fr-FR').format(date);
+    if (/[-/:T]/.test(String(value))) {
+      const parsed = new Date(value);
+      if (!Number.isNaN(parsed.getTime())) return parsed;
     }
-    return clean(value);
+    return null;
+  }
+
+  function formatSaleAge(value, now = new Date()) {
+    const start = saleDate(value);
+    if (!start) return clean(value) || '—';
+
+    const end = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()));
+    const startDay = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate()));
+    if (startDay > end) return '0j';
+
+    let years = end.getUTCFullYear() - startDay.getUTCFullYear();
+    let cursor = new Date(Date.UTC(
+      startDay.getUTCFullYear() + years,
+      startDay.getUTCMonth(),
+      startDay.getUTCDate()
+    ));
+    if (cursor > end) {
+      years -= 1;
+      cursor = new Date(Date.UTC(
+        startDay.getUTCFullYear() + years,
+        startDay.getUTCMonth(),
+        startDay.getUTCDate()
+      ));
+    }
+
+    let months = (end.getUTCFullYear() - cursor.getUTCFullYear()) * 12
+      + end.getUTCMonth() - cursor.getUTCMonth();
+    let monthCursor = new Date(Date.UTC(
+      cursor.getUTCFullYear(),
+      cursor.getUTCMonth() + months,
+      cursor.getUTCDate()
+    ));
+    if (monthCursor > end) {
+      months -= 1;
+      monthCursor = new Date(Date.UTC(
+        cursor.getUTCFullYear(),
+        cursor.getUTCMonth() + months,
+        cursor.getUTCDate()
+      ));
+    }
+
+    const days = Math.floor((end - monthCursor) / 86400000);
+    if (years > 0) return `${years}a${months ? `${months}m` : ''}`;
+    if (months > 0) return `${months}m${days ? `${days}j` : ''}`;
+    return `${days}j`;
   }
 
   function saleFromObject(item) {
@@ -474,7 +559,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.2.0',
+      version: '2.3.0',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
@@ -515,6 +600,9 @@
     if (!status || !content || !actions) return;
     const keepa = snapshot?.metadata?.sources?.keepa || {};
     const sales = extractRecentSales(snapshot);
+    const fiveSalesAverage = sales.length
+      ? sales.reduce((total, sale) => total + asPrice(sale.price), 0) / sales.length
+      : '';
     status.className = 'cal-biblio-status success';
     status.textContent = `Données BiblioScan${savedAt ? ` · cache du ${new Date(savedAt).toLocaleDateString('fr-FR')}` : ''}`;
     content.replaceChildren();
@@ -523,21 +611,21 @@
     metrics.className = 'cal-biblio-metrics';
     metrics.innerHTML = `
       <span><b>${keepa.freq12 ?? '—'}</b> ventes / 12 mois</span>
-      <span>Moyenne : <b>${formatPrice(keepa.meanusedprice)}</b></span>
+      <span>Moy. ${sales.length || 5} ventes : <b>${formatPrice(fiveSalesAverage)}</b></span>
     `;
     content.appendChild(metrics);
 
     if (sales.length) {
       const table = document.createElement('table');
       table.className = 'cal-sales-table';
-      table.innerHTML = '<tbody><tr class="cal-sale-dates"><th>Vendu le</th></tr><tr class="cal-sale-prices"><th>Au prix de</th></tr></tbody>';
+      table.innerHTML = '<tbody><tr class="cal-sale-dates"><th>Vendu il y a</th></tr><tr class="cal-sale-prices"><th>Au prix de</th></tr></tbody>';
       const body = table.querySelector('tbody');
       const dateRow = body.querySelector('.cal-sale-dates');
       const priceRow = body.querySelector('.cal-sale-prices');
       sales.forEach((sale) => {
         const date = document.createElement('td');
         const price = document.createElement('td');
-        date.textContent = formatSaleDate(sale.date);
+        date.textContent = formatSaleAge(sale.date);
         price.textContent = formatPrice(sale.price);
         dateRow.appendChild(date);
         priceRow.appendChild(price);
