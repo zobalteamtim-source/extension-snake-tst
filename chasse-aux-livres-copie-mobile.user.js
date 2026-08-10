@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.0.0
-// @description  Copie les infos d'un livre et affiche automatiquement les 5 dernières ventes BiblioScan.
+// @version      2.1.0
+// @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
 // @match        https://chasse-aux-livres.fr/prix/*
@@ -90,6 +90,54 @@
     return clean(value);
   }
 
+  const comparable = (value) => clean(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+
+  function summaryNearHeading() {
+    const headings = [...document.querySelectorAll('h2, h3, h4, h5, [role="heading"], dt, strong')];
+    const heading = headings.find((element) => /^(resume|description)( du livre)?$/.test(comparable(element.textContent)));
+    if (!heading) return '';
+
+    const candidates = [];
+    let sibling = heading.nextElementSibling;
+    for (let index = 0; sibling && index < 3; index += 1, sibling = sibling.nextElementSibling) {
+      candidates.push(clean(sibling.innerText || sibling.textContent));
+    }
+
+    const section = heading.closest('section, article');
+    if (section) {
+      const paragraphs = [...section.querySelectorAll('p')].map((p) => clean(p.innerText || p.textContent));
+      candidates.push(paragraphs.join('\n'));
+    }
+
+    return candidates.find((text) => text.length >= 40 && text.length <= 12000) || '';
+  }
+
+  function readSummary(primaryBook) {
+    const selectors = [
+      '[itemprop="description"]',
+      '[class*="book-description" i]',
+      '[id*="book-description" i]',
+      '[class*="resume" i]',
+      '[id*="resume" i]',
+    ];
+    const domCandidates = selectors
+      .flatMap((selector) => [...document.querySelectorAll(selector)])
+      .filter((element) => !element.closest(`#${PANEL_ID}`))
+      .map((element) => clean(element.innerText || element.textContent))
+      .filter((text) => text.length >= 40 && text.length <= 12000)
+      .sort((a, b) => a.length - b.length);
+
+    return clean(
+      namedValue(primaryBook.description) ||
+      summaryNearHeading() ||
+      domCandidates[0] ||
+      ''
+    );
+  }
+
   function validIsbn13(value) {
     const digits = String(value || '').replace(/\D/g, '');
     if (!/^97[89]\d{10}$/.test(digits)) return '';
@@ -147,10 +195,12 @@
       namedValue(primaryBook.weight)
     );
 
-    return { title, author, publisher, isbn13, weight };
+    const summary = readSummary(primaryBook);
+
+    return { title, author, publisher, isbn13, weight, summary };
   }
 
-  async function copyText(text, button) {
+  async function writeClipboard(text) {
     if (!text) return;
 
     try {
@@ -166,6 +216,11 @@
       document.execCommand('copy');
       area.remove();
     }
+  }
+
+  async function copyText(text, button) {
+    if (!text) return;
+    await writeClipboard(text);
 
     const oldText = button.querySelector('.cal-label').textContent;
     button.classList.add('cal-copied');
@@ -311,10 +366,9 @@
 
   function saleFromObject(item) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-    const priceKeys = ['price', 'amount', 'value', 'salePrice', 'soldPrice', 'usedPrice', 'prix'];
-    const dateKeys = ['date', 'time', 'timestamp', 'soldAt', 'saleDate', 'age', 'ago', 'label'];
-    const priceKey = priceKeys.find((key) => item[key] !== undefined);
-    const dateKey = dateKeys.find((key) => item[key] !== undefined);
+    const keys = Object.keys(item);
+    const priceKey = keys.find((key) => /^(price|amount|value|sale[_-]?price|sold[_-]?price|used[_-]?price|prix)$/i.test(key));
+    const dateKey = keys.find((key) => /^(date|time|timestamp|sold[_-]?at|sale[_-]?date|age|ago|days[_-]?ago|label)$/i.test(key));
     if (!priceKey || !dateKey || asPrice(item[priceKey]) === '') return null;
     return { date: item[dateKey], price: item[priceKey] };
   }
@@ -343,8 +397,9 @@
     return found;
   }
 
-  function pairParallelArrays(keepa) {
-    const entries = Object.entries(keepa || {}).filter(([, value]) => Array.isArray(value));
+  function pairParallelArrays(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+    const entries = Object.entries(value).filter(([, child]) => Array.isArray(child));
     const dates = entries.filter(([key]) => /(sale|sold|vente).*(date|time|ago)|(date|time).*(sale|sold|vente)/i.test(key));
     const prices = entries.filter(([key]) => /(sale|sold|vente).*(price|amount|prix)|(price|amount|prix).*(sale|sold|vente)/i.test(key));
 
@@ -355,16 +410,21 @@
         }
       }
     }
+
+    for (const child of Object.values(value)) {
+      const nested = pairParallelArrays(child);
+      if (nested.length) return nested;
+    }
     return [];
   }
 
   function extractRecentSales(snapshot) {
-    const keepa = snapshot?.metadata?.sources?.keepa || {};
-    const parallel = pairParallelArrays(keepa);
-    const candidates = collectArrayCandidates(keepa)
+    const metadata = snapshot?.metadata || {};
+    const parallel = pairParallelArrays(metadata);
+    const candidates = collectArrayCandidates(metadata)
       .map((candidate) => ({
         ...candidate,
-        score: candidate.score + (/(sale|sold|vente|history|historique)/i.test(candidate.path) ? 10 : 0),
+        score: candidate.score + (/(last.*sale|sale.*history|sold|vente|historique)/i.test(candidate.path) ? 20 : 0),
       }))
       .sort((a, b) => b.score - a.score);
 
@@ -372,6 +432,45 @@
     return sales
       .filter((sale) => asPrice(sale.price) !== '')
       .slice(0, 5);
+  }
+
+  async function enrichSalesSnapshot(snapshot, apiKey) {
+    if (extractRecentSales(snapshot).length) return snapshot;
+    const asin = clean(snapshot?.metadata?.sources?.keepa?.asin);
+    if (!asin) return snapshot;
+
+    const detail = await biblioscanRequest(`/api/metadata/${encodeURIComponent(asin)}`, apiKey);
+    const metadata = detail?.metadata || (detail?.sources ? detail : null);
+    return metadata ? { ...snapshot, metadata } : snapshot;
+  }
+
+  function diagnosticShape(value, depth = 0) {
+    if (depth > 6) return '[profondeur limitée]';
+    if (Array.isArray(value)) {
+      return {
+        length: value.length,
+        sample: value.slice(0, 12).map((item) => diagnosticShape(item, depth + 1)),
+      };
+    }
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(
+        Object.entries(value).map(([key, child]) => [key, diagnosticShape(child, depth + 1)])
+      );
+    }
+    if (typeof value === 'string' && value.length > 300) return `${value.slice(0, 300)}…`;
+    return value;
+  }
+
+  async function copySalesDiagnostic(snapshot, isbn13, button) {
+    const diagnostic = {
+      isbn13,
+      version: '2.1.0',
+      metadata: diagnosticShape(snapshot?.metadata || {}),
+    };
+    await writeClipboard(JSON.stringify(diagnostic, null, 2));
+    const oldLabel = button.textContent;
+    button.textContent = '✓ Diagnostic copié';
+    window.setTimeout(() => { button.textContent = oldLabel; }, 1300);
   }
 
   function biblioElements() {
@@ -436,8 +535,13 @@
     } else {
       const notice = document.createElement('p');
       notice.className = 'cal-biblio-notice';
-      notice.textContent = 'Les données sont arrivées, mais le format des 5 ventes n’a pas été reconnu. Ouvre BiblioScan pour les voir.';
+      notice.textContent = 'BiblioScan n’a pas fourni les 5 ventes dans un format reconnu. Copie le diagnostic et envoie-le-moi : il ne contient pas ta clé API.';
       content.appendChild(notice);
+
+      const diagnosticButton = actionButton('Copier le diagnostic ventes', () => (
+        copySalesDiagnostic(snapshot, isbn13, diagnosticButton)
+      ), true);
+      content.appendChild(diagnosticButton);
     }
 
     const link = document.createElement('a');
@@ -474,7 +578,18 @@
     const cacheKey = BIBLIO_CACHE_PREFIX + isbn13;
     const cached = await storedGet(cacheKey);
     if (cached?.snapshot && !forceRefresh) {
-      renderSales(cached.snapshot, isbn13, cached.savedAt);
+      let cachedSnapshot = cached.snapshot;
+      const cachedApiKey = await storedGet(BIBLIO_KEY_STORAGE, '');
+      if (cachedApiKey && !extractRecentSales(cachedSnapshot).length) {
+        setBiblioMessage('Récupération gratuite de l’historique détaillé…', 'loading');
+        try {
+          cachedSnapshot = await enrichSalesSnapshot(cachedSnapshot, cachedApiKey);
+          await storedSet(cacheKey, { ...cached, snapshot: cachedSnapshot });
+        } catch (_) {
+          // Les données principales restent utilisables si l’endpoint détaillé échoue.
+        }
+      }
+      renderSales(cachedSnapshot, isbn13, cached.savedAt);
       actions.append(
         actionButton('Actualiser · 1 crédit', () => loadBiblioscan(isbn13, true), true),
         actionButton('Changer la clé', () => configureBiblio(isbn13), true)
@@ -504,9 +619,14 @@
           await storedSet(cacheKey, { pending: snapshot });
         }
       };
-      const snapshot = pending
+      let snapshot = pending
         ? await resumeBiblioscan(pending, apiKey, savePending)
         : await scanBiblioscan(isbn13, apiKey, savePending);
+      try {
+        snapshot = await enrichSalesSnapshot(snapshot, apiKey);
+      } catch (_) {
+        // Le scan principal reste affiché même si l’historique détaillé est indisponible.
+      }
       const cache = { savedAt: Date.now(), snapshot };
       await storedSet(cacheKey, cache);
       renderSales(snapshot, isbn13, cache.savedAt);
@@ -552,7 +672,7 @@
         z-index: 2147483646;
         box-sizing: border-box;
         width: 100%;
-        padding: max(12px, env(safe-area-inset-top)) 12px 14px;
+        padding: max(8px, env(safe-area-inset-top)) 8px 9px;
         color: #17211b;
         background: linear-gradient(145deg, #f4fff7, #e5f7eb);
         border-bottom: 2px solid #237a45;
@@ -564,22 +684,22 @@
         display: flex;
         align-items: center;
         justify-content: space-between;
-        gap: 10px;
-        margin: 0 0 10px;
-        font-size: 17px;
+        gap: 7px;
+        margin: 0 0 6px;
+        font-size: 15px;
         font-weight: 800;
       }
-      #${PANEL_ID} .cal-hint { color: #4d6756; font-size: 12px; font-weight: 600; }
+      #${PANEL_ID} .cal-hint { color: #4d6756; font-size: 11px; font-weight: 600; }
       #${PANEL_ID} .cal-grid {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 8px;
+        gap: 5px;
       }
       #${PANEL_ID} .cal-copy-button {
         min-width: 0;
-        min-height: 64px;
+        min-height: 45px;
         margin: 0;
-        padding: 10px 11px;
+        padding: 6px 8px;
         appearance: none;
         -webkit-appearance: none;
         touch-action: manipulation;
@@ -587,7 +707,7 @@
         color: #183d27;
         background: #fff;
         border: 1px solid #9ccbad;
-        border-radius: 12px;
+        border-radius: 9px;
         box-shadow: 0 1px 3px rgba(0, 0, 0, .07);
         font: inherit;
       }
@@ -595,56 +715,56 @@
       #${PANEL_ID} .cal-copy-button.cal-copied { color: #fff; background: #237a45; }
       #${PANEL_ID} .cal-copy-button:disabled { opacity: .55; }
       #${PANEL_ID} .cal-wide { grid-column: 1 / -1; }
-      #${PANEL_ID} .cal-label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 800; }
+      #${PANEL_ID} .cal-label { display: block; margin-bottom: 2px; font-size: 12px; line-height: 1.15; font-weight: 800; }
       #${PANEL_ID} .cal-value {
         display: -webkit-box;
         overflow: hidden;
         color: inherit;
-        font-size: 12px;
-        line-height: 1.25;
+        font-size: 10.5px;
+        line-height: 1.15;
         overflow-wrap: anywhere;
         opacity: .82;
         -webkit-box-orient: vertical;
-        -webkit-line-clamp: 2;
+        -webkit-line-clamp: 1;
       }
       #${PANEL_ID} .cal-biblio {
-        margin-top: 12px;
-        padding: 12px;
+        margin-top: 8px;
+        padding: 9px;
         background: #fff;
         border: 1px solid #9ccbad;
-        border-radius: 12px;
+        border-radius: 9px;
       }
-      #${PANEL_ID} .cal-biblio-title { margin: 0 0 5px; font-size: 16px; font-weight: 850; }
-      #${PANEL_ID} .cal-biblio-status { margin: 0 0 10px; color: #52685a; font-size: 12px; }
+      #${PANEL_ID} .cal-biblio-title { margin: 0 0 3px; font-size: 14px; font-weight: 850; }
+      #${PANEL_ID} .cal-biblio-status { margin: 0 0 7px; color: #52685a; font-size: 11px; }
       #${PANEL_ID} .cal-biblio-status.loading { color: #805c00; }
       #${PANEL_ID} .cal-biblio-status.success { color: #237a45; }
       #${PANEL_ID} .cal-biblio-status.error { color: #a12626; }
       #${PANEL_ID} .cal-biblio-metrics {
         display: grid;
         grid-template-columns: repeat(2, minmax(0, 1fr));
-        gap: 7px;
-        margin-bottom: 10px;
+        gap: 5px;
+        margin-bottom: 7px;
       }
-      #${PANEL_ID} .cal-biblio-metrics span { padding: 8px; background: #eef8f1; border-radius: 8px; font-size: 12px; }
-      #${PANEL_ID} .cal-sales-table { width: 100%; margin: 4px 0 10px; border-collapse: collapse; font-size: 13px; }
+      #${PANEL_ID} .cal-biblio-metrics span { padding: 6px; background: #eef8f1; border-radius: 7px; font-size: 11px; }
+      #${PANEL_ID} .cal-sales-table { width: 100%; margin: 3px 0 7px; border-collapse: collapse; font-size: 12px; }
       #${PANEL_ID} .cal-sales-table th, #${PANEL_ID} .cal-sales-table td {
-        padding: 8px;
+        padding: 6px;
         text-align: left;
         border: 1px solid #c8ddd0;
       }
       #${PANEL_ID} .cal-sales-table th { background: #eef8f1; }
-      #${PANEL_ID} .cal-biblio-notice { margin: 8px 0; font-size: 12px; line-height: 1.35; }
-      #${PANEL_ID} .cal-biblio-link { display: inline-block; margin: 2px 0 8px; color: #176b39; font-size: 13px; font-weight: 750; }
-      #${PANEL_ID} .cal-biblio-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+      #${PANEL_ID} .cal-biblio-notice { margin: 6px 0; font-size: 11px; line-height: 1.3; }
+      #${PANEL_ID} .cal-biblio-link { display: inline-block; margin: 2px 0 6px; color: #176b39; font-size: 12px; font-weight: 750; }
+      #${PANEL_ID} .cal-biblio-actions { display: flex; flex-wrap: wrap; gap: 5px; }
       #${PANEL_ID} .cal-biblio-button {
-        min-height: 42px;
-        padding: 8px 12px;
+        min-height: 34px;
+        padding: 6px 9px;
         color: #fff;
         background: #237a45;
         border: 0;
         border-radius: 9px;
         font: inherit;
-        font-size: 13px;
+        font-size: 11px;
         font-weight: 800;
       }
       #${PANEL_ID} .cal-biblio-button.secondary { color: #235333; background: #e7f4eb; }
@@ -678,7 +798,8 @@
       makeButton("l’auteur", data.author),
       makeButton("l’éditeur", data.publisher),
       makeButton("l’ISBN-13", data.isbn13),
-      makeButton('le poids', data.weight)
+      makeButton('le poids', data.weight),
+      makeButton('le résumé', data.summary)
     );
 
     document.head.appendChild(style);
