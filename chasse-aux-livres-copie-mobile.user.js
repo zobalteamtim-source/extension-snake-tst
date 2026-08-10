@@ -1,13 +1,20 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      1.0.0
-// @description  Place en haut des fiches livre des boutons pour copier titre, auteur, éditeur, ISBN-13 et poids.
+// @version      2.0.0
+// @description  Copie les infos d'un livre et affiche automatiquement les 5 dernières ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
 // @match        https://chasse-aux-livres.fr/prix/*
+// @downloadURL  https://raw.githubusercontent.com/zobalteamtim-source/extension-snake-tst/momox-price-checker-4693882804824414681/chasse-aux-livres-copie-mobile.user.js
+// @updateURL    https://raw.githubusercontent.com/zobalteamtim-source/extension-snake-tst/momox-price-checker-4693882804824414681/chasse-aux-livres-copie-mobile.user.js
 // @run-at       document-idle
-// @grant        none
+// @grant        GM.xmlHttpRequest
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.deleteValue
+// @connect      biblioscan.ai
+// @inject-into  content
 // ==/UserScript==
 
 (function () {
@@ -16,6 +23,10 @@
   const PANEL_ID = 'cal-copie-rapide';
   const RETRIES = 20;
   const RETRY_DELAY = 500;
+  const BIBLIO_API = 'https://biblioscan.ai';
+  const BIBLIO_KEY_STORAGE = 'cal_biblioscan_api_key';
+  const BIBLIO_CACHE_PREFIX = 'cal_biblioscan_cache_';
+  const gmApi = typeof GM !== 'undefined' ? GM : null;
 
   const clean = (value) => String(value ?? '')
     .replace(/\u00a0/g, ' ')
@@ -177,6 +188,346 @@
     return button;
   }
 
+  async function storedGet(key, fallback = null) {
+    if (typeof gmApi?.getValue === 'function') return gmApi.getValue(key, fallback);
+    try {
+      const value = localStorage.getItem(key);
+      return value === null ? fallback : JSON.parse(value);
+    } catch (_) {
+      return fallback;
+    }
+  }
+
+  async function storedSet(key, value) {
+    if (typeof gmApi?.setValue === 'function') return gmApi.setValue(key, value);
+    localStorage.setItem(key, JSON.stringify(value));
+  }
+
+  async function storedDelete(key) {
+    if (typeof gmApi?.deleteValue === 'function') return gmApi.deleteValue(key);
+    localStorage.removeItem(key);
+  }
+
+  function parseResponse(response) {
+    if (response?.response && typeof response.response === 'object') return response.response;
+    const text = response?.responseText || response?.response || '';
+    try {
+      return JSON.parse(text);
+    } catch (_) {
+      return {};
+    }
+  }
+
+  async function biblioscanRequest(path, apiKey, options = {}) {
+    if (typeof gmApi?.xmlHttpRequest !== 'function') {
+      throw new Error('Cette version de Userscripts ne fournit pas GM.xmlHttpRequest.');
+    }
+
+    const response = await gmApi.xmlHttpRequest({
+      method: options.method || 'GET',
+      url: BIBLIO_API + path,
+      headers: {
+        Authorization: apiKey,
+        'Content-Type': 'application/json',
+      },
+      data: options.body ? JSON.stringify(options.body) : undefined,
+      responseType: 'json',
+      timeout: 30000,
+    });
+
+    const body = parseResponse(response);
+    if (response.status < 200 || response.status >= 300) {
+      const error = new Error(body.error || `Erreur BiblioScan ${response.status}`);
+      error.status = response.status;
+      throw error;
+    }
+    return body;
+  }
+
+  const sleep = (delay) => new Promise((resolve) => window.setTimeout(resolve, delay));
+
+  async function finishBiblioscan(snapshot, apiKey, onProgress) {
+    for (const delay of [500, 1000, 2000, 4000, 8000, 16000]) {
+      if (snapshot.fresh || snapshot.state === 'error') break;
+      if (!snapshot.barcodeScanId) break;
+      await sleep(delay);
+      snapshot = await biblioscanRequest(
+        `/api/barcode/scan/${encodeURIComponent(snapshot.barcodeScanId)}`,
+        apiKey
+      );
+      await onProgress(snapshot);
+    }
+
+    if (!snapshot.metadata) {
+      throw new Error('Analyse encore en cours. Recharge la page dans quelques secondes : aucun nouveau crédit ne sera utilisé.');
+    }
+    return snapshot;
+  }
+
+  async function scanBiblioscan(isbn13, apiKey, onProgress) {
+    const snapshot = await biblioscanRequest('/api/barcode/scan', apiKey, {
+      method: 'POST',
+      body: { ISBN: isbn13, db_lang: 'fr' },
+    });
+    await onProgress(snapshot);
+    return finishBiblioscan(snapshot, apiKey, onProgress);
+  }
+
+  async function resumeBiblioscan(pending, apiKey, onProgress) {
+    const snapshot = await biblioscanRequest(
+      `/api/barcode/scan/${encodeURIComponent(pending.barcodeScanId)}`,
+      apiKey
+    );
+    await onProgress(snapshot);
+    return finishBiblioscan(snapshot, apiKey, onProgress);
+  }
+
+  function asPrice(value) {
+    if (value === null || value === undefined || value === '') return '';
+    if (typeof value === 'string') {
+      const number = Number(value.replace(',', '.').replace(/[^0-9.-]/g, ''));
+      return Number.isFinite(number) ? number : '';
+    }
+    return Number.isFinite(Number(value)) ? Number(value) : '';
+  }
+
+  function formatPrice(value) {
+    const price = asPrice(value);
+    return price === '' ? '—' : `${new Intl.NumberFormat('fr-FR', { maximumFractionDigits: 2 }).format(price)} €`;
+  }
+
+  function formatSaleDate(value) {
+    if (value === null || value === undefined || value === '') return '—';
+    if (typeof value === 'number' && value > 1000000000) {
+      const milliseconds = value < 100000000000 ? value * 1000 : value;
+      return new Intl.DateTimeFormat('fr-FR').format(new Date(milliseconds));
+    }
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime()) && /[-/:T]/.test(String(value))) {
+      return new Intl.DateTimeFormat('fr-FR').format(date);
+    }
+    return clean(value);
+  }
+
+  function saleFromObject(item) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
+    const priceKeys = ['price', 'amount', 'value', 'salePrice', 'soldPrice', 'usedPrice', 'prix'];
+    const dateKeys = ['date', 'time', 'timestamp', 'soldAt', 'saleDate', 'age', 'ago', 'label'];
+    const priceKey = priceKeys.find((key) => item[key] !== undefined);
+    const dateKey = dateKeys.find((key) => item[key] !== undefined);
+    if (!priceKey || !dateKey || asPrice(item[priceKey]) === '') return null;
+    return { date: item[dateKey], price: item[priceKey] };
+  }
+
+  function collectArrayCandidates(value, path = '', found = []) {
+    if (!value || typeof value !== 'object') return found;
+    if (Array.isArray(value)) {
+      const objectSales = value.map(saleFromObject).filter(Boolean);
+      if (objectSales.length) found.push({ path, sales: objectSales, score: objectSales.length + 5 });
+
+      const pairSales = value.map((item) => {
+        if (!Array.isArray(item) || item.length < 2) return null;
+        const firstPrice = asPrice(item[0]);
+        const secondPrice = asPrice(item[1]);
+        if (firstPrice !== '' && secondPrice === '') return { price: item[0], date: item[1] };
+        if (secondPrice !== '') return { date: item[0], price: item[1] };
+        return null;
+      }).filter(Boolean);
+      if (pairSales.length) found.push({ path, sales: pairSales, score: pairSales.length + 3 });
+      return found;
+    }
+
+    for (const [key, child] of Object.entries(value)) {
+      collectArrayCandidates(child, path ? `${path}.${key}` : key, found);
+    }
+    return found;
+  }
+
+  function pairParallelArrays(keepa) {
+    const entries = Object.entries(keepa || {}).filter(([, value]) => Array.isArray(value));
+    const dates = entries.filter(([key]) => /(sale|sold|vente).*(date|time|ago)|(date|time).*(sale|sold|vente)/i.test(key));
+    const prices = entries.filter(([key]) => /(sale|sold|vente).*(price|amount|prix)|(price|amount|prix).*(sale|sold|vente)/i.test(key));
+
+    for (const [, dateValues] of dates) {
+      for (const [, priceValues] of prices) {
+        if (dateValues.length && dateValues.length === priceValues.length) {
+          return dateValues.map((date, index) => ({ date, price: priceValues[index] }));
+        }
+      }
+    }
+    return [];
+  }
+
+  function extractRecentSales(snapshot) {
+    const keepa = snapshot?.metadata?.sources?.keepa || {};
+    const parallel = pairParallelArrays(keepa);
+    const candidates = collectArrayCandidates(keepa)
+      .map((candidate) => ({
+        ...candidate,
+        score: candidate.score + (/(sale|sold|vente|history|historique)/i.test(candidate.path) ? 10 : 0),
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    const sales = parallel.length ? parallel : (candidates[0]?.sales || []);
+    return sales
+      .filter((sale) => asPrice(sale.price) !== '')
+      .slice(0, 5);
+  }
+
+  function biblioElements() {
+    const root = document.querySelector(`#${PANEL_ID} .cal-biblio`);
+    return {
+      root,
+      status: root?.querySelector('.cal-biblio-status'),
+      content: root?.querySelector('.cal-biblio-content'),
+      actions: root?.querySelector('.cal-biblio-actions'),
+    };
+  }
+
+  function setBiblioMessage(message, tone = '') {
+    const { status, content } = biblioElements();
+    if (!status || !content) return;
+    status.className = `cal-biblio-status ${tone}`;
+    status.textContent = message;
+    content.replaceChildren();
+  }
+
+  function actionButton(label, handler, secondary = false) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `cal-biblio-button${secondary ? ' secondary' : ''}`;
+    button.textContent = label;
+    button.addEventListener('click', handler);
+    return button;
+  }
+
+  function renderSales(snapshot, isbn13, savedAt) {
+    const { status, content, actions } = biblioElements();
+    if (!status || !content || !actions) return;
+    const keepa = snapshot?.metadata?.sources?.keepa || {};
+    const sales = extractRecentSales(snapshot);
+    status.className = 'cal-biblio-status success';
+    status.textContent = `Données BiblioScan${savedAt ? ` · cache du ${new Date(savedAt).toLocaleDateString('fr-FR')}` : ''}`;
+    content.replaceChildren();
+
+    const metrics = document.createElement('div');
+    metrics.className = 'cal-biblio-metrics';
+    metrics.innerHTML = `
+      <span><b>${keepa.freq12 ?? '—'}</b> ventes / 12 mois</span>
+      <span>Moyenne : <b>${formatPrice(keepa.meanusedprice)}</b></span>
+    `;
+    content.appendChild(metrics);
+
+    if (sales.length) {
+      const table = document.createElement('table');
+      table.className = 'cal-sales-table';
+      table.innerHTML = '<thead><tr><th>Vendu</th><th>Prix</th></tr></thead><tbody></tbody>';
+      const body = table.querySelector('tbody');
+      sales.forEach((sale) => {
+        const row = document.createElement('tr');
+        const date = document.createElement('td');
+        const price = document.createElement('td');
+        date.textContent = formatSaleDate(sale.date);
+        price.textContent = formatPrice(sale.price);
+        row.append(date, price);
+        body.appendChild(row);
+      });
+      content.appendChild(table);
+    } else {
+      const notice = document.createElement('p');
+      notice.className = 'cal-biblio-notice';
+      notice.textContent = 'Les données sont arrivées, mais le format des 5 ventes n’a pas été reconnu. Ouvre BiblioScan pour les voir.';
+      content.appendChild(notice);
+    }
+
+    const link = document.createElement('a');
+    link.className = 'cal-biblio-link';
+    link.href = `${BIBLIO_API}/barcode/${isbn13}?db_lang=fr`;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.textContent = 'Ouvrir la fiche BiblioScan ↗';
+    content.appendChild(link);
+  }
+
+  async function configureBiblio(isbn13) {
+    const value = window.prompt(
+      'Colle ta clé API BiblioScan (elle commence par bsk_). Elle restera uniquement dans Userscripts sur cet appareil.'
+    );
+    if (value === null) return;
+    const key = clean(value);
+    if (!/^bsk_[a-f0-9]{48}$/i.test(key)) {
+      window.alert('Clé invalide : elle doit commencer par bsk_ et contenir 48 caractères hexadécimaux ensuite.');
+      return;
+    }
+    await storedSet(BIBLIO_KEY_STORAGE, key);
+    await loadBiblioscan(isbn13, true);
+  }
+
+  async function loadBiblioscan(isbn13, forceRefresh = false) {
+    const { actions } = biblioElements();
+    if (!actions || !isbn13) {
+      setBiblioMessage('ISBN-13 introuvable : analyse BiblioScan impossible.', 'error');
+      return;
+    }
+
+    actions.replaceChildren();
+    const cacheKey = BIBLIO_CACHE_PREFIX + isbn13;
+    const cached = await storedGet(cacheKey);
+    if (cached?.snapshot && !forceRefresh) {
+      renderSales(cached.snapshot, isbn13, cached.savedAt);
+      actions.append(
+        actionButton('Actualiser · 1 crédit', () => loadBiblioscan(isbn13, true), true),
+        actionButton('Changer la clé', () => configureBiblio(isbn13), true)
+      );
+      return;
+    }
+
+    const apiKey = await storedGet(BIBLIO_KEY_STORAGE, '');
+    if (!apiKey) {
+      setBiblioMessage('Clé API nécessaire pour charger automatiquement les ventes.', '');
+      actions.append(actionButton('Configurer BiblioScan', () => configureBiblio(isbn13)));
+      return;
+    }
+
+    const pending = !forceRefresh && cached?.pending?.barcodeScanId ? cached.pending : null;
+    setBiblioMessage(
+      pending
+        ? `Reprise de l’analyse de ${isbn13}… aucun nouveau crédit.`
+        : `Analyse automatique de ${isbn13}… 1 crédit sera utilisé.`,
+      'loading'
+    );
+    actions.append(actionButton('Changer la clé', () => configureBiblio(isbn13), true));
+
+    try {
+      const savePending = async (snapshot) => {
+        if (snapshot?.barcodeScanId && !snapshot.metadata) {
+          await storedSet(cacheKey, { pending: snapshot });
+        }
+      };
+      const snapshot = pending
+        ? await resumeBiblioscan(pending, apiKey, savePending)
+        : await scanBiblioscan(isbn13, apiKey, savePending);
+      const cache = { savedAt: Date.now(), snapshot };
+      await storedSet(cacheKey, cache);
+      renderSales(snapshot, isbn13, cache.savedAt);
+      actions.replaceChildren(
+        actionButton('Actualiser · 1 crédit', () => loadBiblioscan(isbn13, true), true),
+        actionButton('Changer la clé', () => configureBiblio(isbn13), true)
+      );
+    } catch (error) {
+      if (error.status === 401) await storedDelete(BIBLIO_KEY_STORAGE);
+      const latestCache = await storedGet(cacheKey);
+      const canResume = error.status !== 401 && Boolean(latestCache?.pending?.barcodeScanId);
+      setBiblioMessage(error.status === 401 ? 'Clé refusée ou expirée.' : error.message, 'error');
+      actions.replaceChildren(
+        actionButton(error.status === 401 ? 'Remplacer la clé' : (canResume ? 'Continuer sans nouveau crédit' : 'Réessayer · 1 crédit'), () => (
+          error.status === 401 ? configureBiblio(isbn13) : loadBiblioscan(isbn13, !canResume)
+        )),
+        actionButton('Ouvrir BiblioScan', () => window.open(`${BIBLIO_API}/barcode/${isbn13}?db_lang=fr`, '_blank'), true)
+      );
+    }
+  }
+
   function install(attempt = 0) {
     if (document.getElementById(PANEL_ID)) return;
 
@@ -256,6 +607,47 @@
         -webkit-box-orient: vertical;
         -webkit-line-clamp: 2;
       }
+      #${PANEL_ID} .cal-biblio {
+        margin-top: 12px;
+        padding: 12px;
+        background: #fff;
+        border: 1px solid #9ccbad;
+        border-radius: 12px;
+      }
+      #${PANEL_ID} .cal-biblio-title { margin: 0 0 5px; font-size: 16px; font-weight: 850; }
+      #${PANEL_ID} .cal-biblio-status { margin: 0 0 10px; color: #52685a; font-size: 12px; }
+      #${PANEL_ID} .cal-biblio-status.loading { color: #805c00; }
+      #${PANEL_ID} .cal-biblio-status.success { color: #237a45; }
+      #${PANEL_ID} .cal-biblio-status.error { color: #a12626; }
+      #${PANEL_ID} .cal-biblio-metrics {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 7px;
+        margin-bottom: 10px;
+      }
+      #${PANEL_ID} .cal-biblio-metrics span { padding: 8px; background: #eef8f1; border-radius: 8px; font-size: 12px; }
+      #${PANEL_ID} .cal-sales-table { width: 100%; margin: 4px 0 10px; border-collapse: collapse; font-size: 13px; }
+      #${PANEL_ID} .cal-sales-table th, #${PANEL_ID} .cal-sales-table td {
+        padding: 8px;
+        text-align: left;
+        border: 1px solid #c8ddd0;
+      }
+      #${PANEL_ID} .cal-sales-table th { background: #eef8f1; }
+      #${PANEL_ID} .cal-biblio-notice { margin: 8px 0; font-size: 12px; line-height: 1.35; }
+      #${PANEL_ID} .cal-biblio-link { display: inline-block; margin: 2px 0 8px; color: #176b39; font-size: 13px; font-weight: 750; }
+      #${PANEL_ID} .cal-biblio-actions { display: flex; flex-wrap: wrap; gap: 7px; }
+      #${PANEL_ID} .cal-biblio-button {
+        min-height: 42px;
+        padding: 8px 12px;
+        color: #fff;
+        background: #237a45;
+        border: 0;
+        border-radius: 9px;
+        font: inherit;
+        font-size: 13px;
+        font-weight: 800;
+      }
+      #${PANEL_ID} .cal-biblio-button.secondary { color: #235333; background: #e7f4eb; }
       @media (min-width: 760px) {
         #${PANEL_ID} .cal-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
         #${PANEL_ID} .cal-wide { grid-column: span 3; }
@@ -271,6 +663,12 @@
         <span class="cal-hint">Touchez un bloc</span>
       </div>
       <div class="cal-grid"></div>
+      <div class="cal-biblio">
+        <div class="cal-biblio-title">📈 5 dernières ventes BiblioScan</div>
+        <p class="cal-biblio-status">Préparation…</p>
+        <div class="cal-biblio-content"></div>
+        <div class="cal-biblio-actions"></div>
+      </div>
     `;
 
     const grid = panel.querySelector('.cal-grid');
@@ -285,6 +683,7 @@
 
     document.head.appendChild(style);
     document.body.prepend(panel);
+    loadBiblioscan(data.isbn13);
   }
 
   install();
