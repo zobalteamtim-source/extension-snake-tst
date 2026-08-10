@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Chasse aux Livres — copie rapide mobile
 // @namespace    https://www.chasse-aux-livres.fr/
-// @version      2.4.1
+// @version      2.5.0
 // @description  Copie les infos et le résumé d'un livre, avec les données de ventes BiblioScan.
 // @author       Vous
 // @match        https://www.chasse-aux-livres.fr/prix/*
@@ -95,11 +95,28 @@
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase();
 
+  function looksLikeBookMetadata(value) {
+    const text = comparable(value);
+    const hasPages = /\b\d{1,5}\s*pages?\b/.test(text);
+    const hasYear = /(?:^|\D)(?:18|19|20)\d{2}(?:\D|$)/.test(text);
+    const hasFormat = /\b(broche|relie|poche|cartonne|ebook|livre numerique|couverture souple|couverture rigide)\b/.test(text);
+    const hasReviewLink = /\bmon avis\b/.test(text);
+    const middleDots = (String(value || '').match(/·/g) || []).length;
+
+    // Sur Chasse aux Livres, la description SEO peut être uniquement la fiche
+    // technique : titre, auteur, éditeur, format, pages, année, catégorie, avis.
+    return hasReviewLink ||
+      (hasPages && hasFormat) ||
+      (hasPages && hasYear && middleDots >= 2) ||
+      (hasFormat && hasYear && middleDots >= 3);
+  }
+
   function usableSummary(value) {
     const text = clean(value);
     if (text.length < 60 || text.length > 12000) return '';
     if (/^(paru|publie|sorti)\s+le\b/i.test(comparable(text))) return '';
     if (/^(resume|description)(\s+voir tout)?$/i.test(comparable(text))) return '';
+    if (looksLikeBookMetadata(text)) return '';
     return text;
   }
 
@@ -388,7 +405,7 @@
       .slice(0, 20)
       .map(describeSummaryElement);
     return {
-      version: '2.4.1',
+      version: '2.5.0',
       url: location.href,
       labels,
       containers,
@@ -719,7 +736,7 @@
   async function copySalesDiagnostic(snapshot, isbn13, button) {
     const diagnostic = {
       isbn13,
-      version: '2.4.1',
+      version: '2.5.0',
       metadata: diagnosticShape(snapshot?.metadata || {}),
     };
     await writeClipboard(JSON.stringify(diagnostic, null, 2));
